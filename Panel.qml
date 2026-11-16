@@ -51,6 +51,7 @@ Panel {
   readonly property var enabledActions: Model.enabledActions(actions)
   readonly property var providers: snapshot && snapshot.providers ? snapshot.providers : []
   readonly property bool hasKey: snapshot && snapshot.hasCurrentKey === true
+  readonly property bool disablePaste: snapshot && snapshot.disablePaste === true
   readonly property bool bindsInstalled: snapshot && snapshot.binds && snapshot.binds.installed === true
   readonly property bool busy: runState === "processing" || mutating || runProc.running || mutateProc.running
   readonly property string pluginDir: pluginDirectory()
@@ -66,6 +67,7 @@ Panel {
       out = [
         { value: "openai", label: "OpenAI" },
         { value: "claude", label: "Claude" },
+        { value: "minimax", label: "MiniMax" },
         { value: "gemini", label: "Gemini" },
         { value: "grok", label: "Grok" }
       ]
@@ -98,6 +100,7 @@ Panel {
     var name = Model.plain(String(provider.displayName || provider.id || ""), 40)
     if (name.indexOf("OpenAI") === 0) return "OpenAI"
     if (name.indexOf("Anthropic") === 0) return "Claude"
+    if (name.indexOf("MiniMax") === 0) return "MiniMax"
     if (name.indexOf("Google") === 0) return "Gemini"
     if (name.indexOf("xAI") === 0) return "Grok"
     return name
@@ -176,6 +179,10 @@ Panel {
 
   function setProvider(id) {
     mutate(["config", "set", "--provider", id])
+  }
+
+  function setDisablePaste(value) {
+    mutate(["config", "set", value ? "--disable-paste" : "--enable-paste"])
   }
 
   function saveKey() {
@@ -863,13 +870,43 @@ Panel {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: "T translate · O improve · G grammar · S summarize · P professional · F this panel"
+                  text: "T translate · O improve · G grammar · S summarize · P professional · C fact check · F this panel"
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   wrapMode: Text.WordWrap
                 }
               }
+            }
+          }
+
+          Column {
+            visible: !root.editing
+            width: parent.width
+            spacing: Style.spacing.labelGap
+
+            PanelSectionHeader {
+              text: "PASTE"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Notifications only (no copy/paste)"
+              checked: root.disablePaste
+              foreground: root.foreground
+              onClicked: root.setDisablePaste(!root.disablePaste)
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "When on, every action shows its result in a notification instead of replacing the selection."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
           }
         }

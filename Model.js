@@ -182,6 +182,7 @@ function emptySnapshot() {
     actions: [],
     hotkeyChord: DEFAULT_CHORD,
     panelKey: "F",
+    disablePaste: false,
     hasCurrentKey: false,
     binds: { installed: false, collisions: [] }
   }

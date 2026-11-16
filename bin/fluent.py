@@ -71,6 +71,13 @@ PROVIDERS = {
         "model": "",
         "requiresKey": False,
     },
+    "minimax": {
+        "id": "minimax",
+        "displayName": "MiniMax",
+        "apiKeyURL": "https://platform.minimax.io/user-center/basic-information/interface-key",
+        "apiKeyPlaceholder": "sk-...",
+        "model": "MiniMax-M3",
+    },
     "gemini": {
         "id": "gemini",
         "displayName": "Google (Gemini)",
@@ -154,6 +161,20 @@ DEFAULT_ACTIONS = [
         "enabled": True,
         "prompt": (
             "Rewrite the following text in a polished professional tone. Preserve the meaning and keep the same language."
+        ),
+    },
+    {
+        "id": "factcheck",
+        "actionId": "factcheck",
+        "name": "Fact check",
+        "key": "C",
+        "enabled": True,
+        "mode": "notify",
+        "prompt": (
+            "Fact-check the claims and ideas in the following text. For each claim, state whether it is "
+            "TRUE, FALSE, MISLEADING, or UNVERIFIABLE, with a one-sentence justification. Keep the same "
+            "language as the input. Be concise: this will be shown in a desktop notification, so keep the "
+            "total output under 500 characters and prioritize the most important claims."
         ),
     },
 ]
@@ -374,6 +395,7 @@ def default_config() -> dict:
         "actions": [dict(action) for action in DEFAULT_ACTIONS],
         "hotkeyChord": DEFAULT_CHORD,
         "panelKey": DEFAULT_PANEL_KEY,
+        "disablePaste": False,
     }
 
 
@@ -382,12 +404,16 @@ def _sanitize_action(raw: dict, fallback_id: str) -> dict:
     key = str(raw.get("key") or "").strip().upper()
     if len(key) != 1 or not key.isalpha():
         key = ""
+    mode = str(raw.get("mode") or "replace").strip().lower()
+    if mode not in {"replace", "notify"}:
+        mode = "replace"
     return {
         "id": action_id,
         "actionId": action_id,
         "name": str(raw.get("name") or action_id).strip() or action_id,
         "key": key,
         "enabled": bool(raw.get("enabled", True)),
+        "mode": mode,
         "prompt": str(raw.get("prompt") or "").strip(),
     }
 
@@ -436,6 +462,8 @@ def normalize_config(raw: dict | None) -> dict:
     panel_key = str(raw.get("panelKey") or "").strip().upper()
     if len(panel_key) == 1 and panel_key.isalpha():
         cfg["panelKey"] = panel_key
+
+    cfg["disablePaste"] = bool(raw.get("disablePaste", False))
 
     return cfg
 
@@ -495,6 +523,7 @@ def public_config(cfg: dict, binds: dict | None = None) -> dict:
         "actions": [dict(action) for action in cfg["actions"]],
         "hotkeyChord": cfg["hotkeyChord"],
         "panelKey": cfg["panelKey"],
+        "disablePaste": bool(cfg.get("disablePaste", False)),
         "hasCurrentKey": bool(keys.get(cfg["provider"]))
         or not PROVIDERS[cfg["provider"]].get("requiresKey", True),
     }
@@ -954,6 +983,7 @@ def capture_selection(
 
 def paste_text(
     text: str,
+    source: str | None = None,
     *,
     restore_after: float = 0.8,
     sleeper=time.sleep,
@@ -961,16 +991,36 @@ def paste_text(
     copy=wl_copy,
     window_is_terminal=active_window_is_terminal,
     shortcut=send_shortcut,
-) -> None:
+) -> bool:
+    """Copy `text` and inject a paste shortcut. Returns a best-effort guess of
+    whether the target actually received it.
+
+    There is no portable way on Wayland to ask "is the focused widget
+    editable". Instead: if `source` (the text that was selected) is given,
+    check the primary selection right after the injected paste. A read-only
+    view (a browser article, a PDF, a terminal without an input line) leaves
+    the original selection highlighted and unchanged, since Ctrl+V/Shift+Insert
+    had nothing to act on. An editable field consumes the selection, so the
+    primary buffer no longer matches it. False negatives (no primary-selection
+    support in the target app) just skip the fallback notification below —
+    they never block the paste attempt itself.
+    """
     original = paste(False)
     copy(text)
     sleeper(0.08)
     mods, key = paste_shortcut(window_is_terminal())
     shortcut(mods, key)
+    sleeper(0.12)
+    pasted = True
+    if source:
+        after_primary = (paste(True) or "").strip()
+        if after_primary and after_primary == str(source).strip():
+            pasted = False
     if restore_after > 0:
         sleeper(restore_after)
         if original:
             copy(original)
+    return pasted
 
 
 def map_status_error(status: int, default: str = "server_error") -> FluentError:
@@ -1135,6 +1185,49 @@ def complete_grok(text: str, api_key: str, prompt: str, model: str, opener=None)
     return content
 
 
+def complete_minimax(text: str, api_key: str, prompt: str, model: str, opener=None) -> str:
+    # MiniMax speaks the Anthropic Messages protocol, so the same body shape as
+    # complete_claude works. The reply can arrive as several content blocks:
+    # reasoning models put a "thinking" block first and the answer second, so
+    # the first "text" block is picked instead of content[0].
+    status, payload, raw = http_json(
+        "https://api.minimax.io/anthropic/v1/messages",
+        {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        {
+            "model": model,
+            "max_tokens": 4096,
+            "system": prompt,
+            "messages": [{"role": "user", "content": text}],
+        },
+        opener=opener,
+    )
+    if status != 200:
+        raise map_status_error(status)
+    if not raw:
+        raise FluentError("no_content")
+    blocks = None
+    try:
+        blocks = payload["content"]
+    except (TypeError, KeyError):
+        blocks = None
+    if not isinstance(blocks, list):
+        raise FluentError("invalid_response")
+    content = ""
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and block.get("text"):
+            content = str(block["text"]).strip()
+            break
+    if not content:
+        raise FluentError("no_content")
+    return content
+
+
 # Tools a bar-widget text rewrite has no business touching. Belt-and-suspenders
 # with --permission-mode/--permission-prompts below, which auto-deny anything
 # that slips past this list instead of hanging on a prompt with no tty.
@@ -1206,6 +1299,7 @@ COMPLETERS = {
     "openai": complete_openai,
     "claude": complete_claude,
     "claude-code": complete_claude_code,
+    "minimax": complete_minimax,
     "gemini": complete_gemini,
     "grok": complete_grok,
 }
@@ -1357,8 +1451,19 @@ def run_action(
             notify("Fluent", error.message, urgency="normal")
         raise
 
-    if paste:
-        paste_fn(result)
+    # A "notify" action (e.g. fact-check) or the global disablePaste switch
+    # means the result is informational, not a replacement for the selection —
+    # it always goes to a notification and never touches the clipboard/paste.
+    notify_only = action.get("mode") == "notify" or bool(cfg.get("disablePaste", False))
+
+    pasted = True
+    if notify_only:
+        pasted = False
+        notify(f"Fluent: {action['name']}", result, urgency="normal")
+    elif paste:
+        pasted = paste_fn(result, source)
+        if not pasted and notify_errors:
+            notify(f"Fluent: {action['name']}", result, urgency="normal")
 
     return {
         "ok": True,
@@ -1366,6 +1471,7 @@ def run_action(
         "action": action["id"],
         "name": action["name"],
         "result": result,
+        "pasted": pasted,
     }
 
 
@@ -1394,6 +1500,10 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         if cfg["provider"] not in PROVIDERS:
             raise FluentError("unknown_provider")
         cfg["models"][cfg["provider"]] = args.model
+    if args.disable_paste:
+        cfg["disablePaste"] = True
+    if args.enable_paste:
+        cfg["disablePaste"] = False
     save_config(cfg)
     return emit(public_config(load_config(), binds=binds_status(load_config())))
 
@@ -1420,6 +1530,7 @@ def cmd_config_set_action(args: argparse.Namespace) -> int:
         "key": args.key or "",
         "prompt": args.prompt or "",
         "enabled": not args.disabled,
+        "mode": args.mode or "replace",
     }
     if args.update:
         existing = find_action(cfg, args.id)
@@ -1432,6 +1543,8 @@ def cmd_config_set_action(args: argparse.Namespace) -> int:
             payload["name"] = args.name
         if args.key is not None:
             payload["key"] = args.key
+        if args.mode:
+            payload["mode"] = args.mode
         if args.disabled:
             payload["enabled"] = False
         if args.enabled:
@@ -1503,6 +1616,8 @@ def build_parser() -> argparse.ArgumentParser:
     setter.add_argument("--chord")
     setter.add_argument("--panel-key")
     setter.add_argument("--model")
+    setter.add_argument("--disable-paste", action="store_true")
+    setter.add_argument("--enable-paste", action="store_true")
     setter.set_defaults(func=cmd_config_set)
 
     key = config_sub.add_parser("set-key")
@@ -1514,6 +1629,7 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--name")
     action.add_argument("--key")
     action.add_argument("--prompt")
+    action.add_argument("--mode", choices=("replace", "notify"))
     action.add_argument("--disabled", action="store_true")
     action.add_argument("--enabled", action="store_true")
     action.add_argument("--update", action="store_true")

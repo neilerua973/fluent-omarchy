@@ -63,10 +63,11 @@ class ConfigTests(unittest.TestCase):
     def test_default_actions_and_keys(self):
         cfg = fluent.default_config()
         self.assertEqual(cfg["provider"], "openai")
-        self.assertEqual([a["id"] for a in cfg["actions"]], ["translate", "improve", "grammar", "summarize", "tone"])
-        self.assertEqual([a["key"] for a in cfg["actions"]], ["T", "O", "G", "S", "P"])
+        self.assertEqual([a["id"] for a in cfg["actions"]], ["translate", "improve", "grammar", "summarize", "tone", "factcheck"])
+        self.assertEqual([a["key"] for a in cfg["actions"]], ["T", "O", "G", "S", "P", "C"])
         self.assertEqual(cfg["hotkeyChord"], "CTRL + ALT + SHIFT")
         self.assertEqual(cfg["panelKey"], "F")
+        self.assertEqual(cfg["disablePaste"], False)
 
     def test_normalize_drops_unknown_provider_and_blank_keys(self):
         cfg = fluent.normalize_config({
@@ -349,6 +350,37 @@ class ProviderTests(unittest.TestCase):
             "rewrite",
         )
 
+    def test_minimax_parser_picks_text_block_after_thinking(self):
+        cfg = fluent.default_config()
+        cfg["apiKeys"]["minimax"] = "key"
+        cfg["provider"] = "minimax"
+        self.assertEqual(
+            fluent.complete_text(cfg, "hola", "inst", opener=opener_for(200, {
+                "content": [
+                    {"type": "thinking", "thinking": "reasoning"},
+                    {"type": "text", "text": " bonjour "},
+                ]
+            })),
+            "bonjour",
+        )
+
+        self.assertEqual(
+            fluent.complete_text(cfg, "hola", "inst", opener=opener_for(200, {
+                "content": [{"type": "text", "text": " rewrite "}]
+            })),
+            "rewrite",
+        )
+
+        with self.assertRaises(fluent.FluentError) as raised:
+            fluent.complete_text(cfg, "hola", "inst", opener=opener_for(200, {
+                "content": [{"type": "thinking", "thinking": "reasoning"}]
+            }))
+        self.assertEqual(raised.exception.code, "no_content")
+
+        with self.assertRaises(fluent.FluentError) as raised:
+            fluent.complete_text(cfg, "hola", "inst", opener=opener_for(200, {"content": "nope"}))
+        self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_network_error(self):
         cfg = fluent.default_config()
         cfg["apiKeys"]["openai"] = "key"
@@ -472,10 +504,124 @@ class RunActionTests(unittest.TestCase):
             notify_errors=False,
             opener=opener_for(200, {"choices": [{"message": {"content": "Hello"}}]}),
             capture=lambda: self.fail("should use explicit text"),
-            paste_fn=lambda value: pasted.append(value),
+            paste_fn=lambda value, source: (pasted.append((value, source)), True)[1],
         )
         self.assertEqual(result["result"], "Hello")
-        self.assertEqual(pasted, ["Hello"])
+        self.assertEqual(pasted, [("Hello", "Hola")])
+        self.assertTrue(result["pasted"])
+
+    def test_run_action_notifies_when_selection_is_read_only(self):
+        cfg = fluent.default_config()
+        cfg["apiKeys"]["openai"] = "key"
+        notified = []
+        original_notify = fluent.notify
+        fluent.notify = lambda title, body, urgency="low": notified.append((title, body, urgency))
+        try:
+            result = fluent.run_action(
+                cfg,
+                "translate",
+                text="Hola",
+                paste=True,
+                notify_errors=True,
+                opener=opener_for(200, {"choices": [{"message": {"content": "Hello"}}]}),
+                capture=lambda: self.fail("should use explicit text"),
+                paste_fn=lambda value, source: False,
+            )
+        finally:
+            fluent.notify = original_notify
+        self.assertFalse(result["pasted"])
+        self.assertEqual(notified, [("Fluent: Translate", "Hello", "normal")])
+
+    def test_run_action_notify_mode_never_pastes(self):
+        cfg = fluent.default_config()
+        cfg["apiKeys"]["openai"] = "key"
+        notified = []
+        original_notify = fluent.notify
+        fluent.notify = lambda title, body, urgency="low": notified.append((title, body, urgency))
+        pasted_calls = []
+        try:
+            result = fluent.run_action(
+                cfg,
+                "factcheck",
+                text="The sky is green.",
+                paste=True,
+                notify_errors=True,
+                opener=opener_for(200, {"choices": [{"message": {"content": "FALSE: the sky is blue."}}]}),
+                capture=lambda: self.fail("should use explicit text"),
+                paste_fn=lambda value, source: (pasted_calls.append((value, source)), True)[1],
+            )
+        finally:
+            fluent.notify = original_notify
+        self.assertEqual(pasted_calls, [])
+        self.assertFalse(result["pasted"])
+        self.assertEqual(notified, [("Fluent: Fact check", "FALSE: the sky is blue.", "normal")])
+
+    def test_run_action_disable_paste_forces_notify_for_any_action(self):
+        cfg = fluent.default_config()
+        cfg["apiKeys"]["openai"] = "key"
+        cfg["disablePaste"] = True
+        notified = []
+        original_notify = fluent.notify
+        fluent.notify = lambda title, body, urgency="low": notified.append((title, body, urgency))
+        pasted_calls = []
+        try:
+            result = fluent.run_action(
+                cfg,
+                "translate",
+                text="Hola",
+                paste=True,
+                notify_errors=True,
+                opener=opener_for(200, {"choices": [{"message": {"content": "Hello"}}]}),
+                capture=lambda: self.fail("should use explicit text"),
+                paste_fn=lambda value, source: (pasted_calls.append((value, source)), True)[1],
+            )
+        finally:
+            fluent.notify = original_notify
+        self.assertEqual(pasted_calls, [])
+        self.assertFalse(result["pasted"])
+        self.assertEqual(notified, [("Fluent: Translate", "Hello", "normal")])
+
+    def test_paste_text_detects_unconsumed_primary_selection(self):
+        state = {"primary": "Hola", "clipboard": "old"}
+
+        def paste(primary=False):
+            return state["primary"] if primary else state["clipboard"]
+
+        def copy(text):
+            state["clipboard"] = text
+
+        pasted = fluent.paste_text(
+            "Hello",
+            "Hola",
+            restore_after=0,
+            sleeper=lambda _s: None,
+            paste=paste,
+            copy=copy,
+            window_is_terminal=lambda: False,
+            shortcut=lambda *_a: None,
+        )
+        self.assertFalse(pasted)
+
+    def test_paste_text_reports_success_when_selection_is_consumed(self):
+        state = {"primary": "", "clipboard": "old"}
+
+        def paste(primary=False):
+            return state["primary"] if primary else state["clipboard"]
+
+        def copy(text):
+            state["clipboard"] = text
+
+        pasted = fluent.paste_text(
+            "Hello",
+            "Hola",
+            restore_after=0,
+            sleeper=lambda _s: None,
+            paste=paste,
+            copy=copy,
+            window_is_terminal=lambda: False,
+            shortcut=lambda *_a: None,
+        )
+        self.assertTrue(pasted)
 
     def test_run_action_unknown_and_empty(self):
         cfg = fluent.default_config()

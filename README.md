@@ -2,6 +2,12 @@
 
 Select text, press a shortcut, rewrite in place. Panel is for the API key, provider, and prompts.
 
+If the selection lives in a read-only view (a browser article, a PDF, a terminal
+with no input line — anywhere Ctrl+V/Shift+Insert has nothing to act on), Fluent
+can't replace it in place. It detects that case and shows the result in a
+desktop notification instead, so you can read or copy it manually. The result
+is also always left on the clipboard.
+
 ```sh
 omarchy plugin add https://github.com/alfonsobries/fluent-omarchy.git --enable
 omarchy plugin update io.github.alfonsobries.fluent
@@ -25,6 +31,7 @@ The helper POSTs only to these HTTPS origins and refuses redirects:
 
 - `https://api.openai.com/v1/chat/completions`
 - `https://api.anthropic.com/v1/messages`
+- `https://api.minimax.io/anthropic/v1/messages`
 - `https://generativelanguage.googleapis.com/v1beta/models/<model>:generateContent`
 - `https://api.x.ai/v1/chat/completions`
 
